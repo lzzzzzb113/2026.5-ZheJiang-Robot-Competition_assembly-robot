@@ -1,0 +1,5 @@
+path: ./datasets/yolo_det_dataset   # 指向转换脚本生成的 dataset 目录
+train: images/train
+val: images/train                    # 如果你没有专门的验证集，先用训练集代替
+nc: 4
+names: ['si', 'san', 'ti', 'yuan']

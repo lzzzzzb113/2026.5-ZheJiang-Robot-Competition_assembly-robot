@@ -1,0 +1,56 @@
+# Local archives and packaged snapshots
+/*.zip
+/*.rar
+/*.7z
+/*.tar
+/*.gz
+/2026COMP/**/*.zip
+/2026COMP/**/*.rar
+/2026COMP/**/*.7z
+/2026COMP/**/*.tar
+/2026COMP/**/*.gz
+
+# Build products and editor state
+**/build/
+**/cmake-build-*/
+**/Objects/
+**/Listings/
+**/.idea/
+**/.vscode/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.log
+**/*.map
+**/*.lst
+**/*.elf
+**/*.bin
+**/*.hex
+**/*.axf
+**/*.o
+**/*.d
+**/*.obj
+**/*.pdb
+**/*.ilk
+**/*.uvguix*
+**/*.uvoptx
+**/*.bak
+
+# Nested repositories and package-manager caches
+**/.git/
+/2026COMP/test/RobotArmANN/RobotArmANN/vcpkg/
+/2026COMP/test/RobotArmANN/RobotArmANN/gsl-2.8/
+
+# Trained models and generated training output
+/2026COMP/**/*.pt
+/2026COMP/**/*.onnx
+/2026COMP/**/*.engine
+/2026COMP/shape_grasp_project/shape_grasp_project/runs/
+
+# Vendored prebuilt desktop application from the Dummy-Robot reference
+/2026COMP/hardware/Dummy-Robot-main/Dummy-Robot-main/3.Software/
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store

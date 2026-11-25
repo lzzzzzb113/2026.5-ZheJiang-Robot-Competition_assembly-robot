@@ -1,0 +1,1546 @@
+使用简洁的日常语言进行一下问题讨论，我有一个机械臂需要识别6种不同的物块
+有如下与摄像头请求的对应代码:
+int MapClawTypeToReqCode(ClawType type) {
+    switch (type) {
+        case YUAN:
+            return 0x36;
+        case SI:
+            return 0x35;
+        case M_TI:
+            return 0x34;
+        case P_TI:
+            return 0x33;
+        case M_SAN:
+            return 0x32;
+        case P_SAN:
+            return 0x31;
+        case SAN:
+            return 0x32;
+        case TI:
+            return 0x34;
+        case NONE_CLAW:
+            return 0x46;
+        default:
+            return 0x46;
+    }
+}
+0x46可以获取所有类型数据,其他为对应请求类型,M为金属材质,P为塑料材质,M和P需要有不同的抓取参数（仅作约束无法改变）,摄像头会返回框的左上原点x,y包围图像的w,h,目标tag以及抓取所需angle(忽略),
+但是呢，当识别材质时，其处于图像中心点圆r=80(完整图像640*480)时，有很大概率识别错误(40%)且其不接近时大概率持续错误，形状也有一定概率识别错误(15%)，会导致误判tag标识使图像索引错误。
+有如下完整通过摄像头，校准抓取位置的代码
+
+extern MainView *mainMenu;
+extern int tick_check;
+ClawType claw_type=YUAN;
+CameraRequestLock *cm_lock;
+
+int camera_handle_id=0;
+float camera_current=0;
+float camera_current_y=0;
+YZF_BOOL camera_finish = YZF_FALSE;
+int STATUS_CAMERA = Status_BEGIN;
+int camera_check_count;
+
+
+YZF_BOOL SUB_SEEKER = YZF_FALSE;
+int STATUS_SUB_SEEKER = Status_BEGIN;
+int sub_dest_x=0, sub_dest_y=0;
+float sub_kpy = 0.02,sub_kpx = 0.05;
+
+float camera_check_x=0;
+float camera_check_y=0;
+float camera_check_z=0;
+float camera_check_r=0;
+float camera_check_claw_R = 0;
+YZF_BOOL camera_check_second = YZF_FALSE;
+ClawType seek_claw_type=NONE_CLAW;
+
+int MapClawTypeToReqCode(ClawType type) {
+    switch (type) {
+        case YUAN:
+            return 0x36;
+        case SI:
+            return 0x35;
+        case M_TI:
+            return 0x34;
+        case P_TI:
+            return 0x33;
+        case M_SAN:
+            return 0x32;
+        case P_SAN:
+            return 0x31;
+        case SAN:
+            return 0x32;
+        case TI:
+            return 0x34;
+        case NONE_CLAW:
+            return 0x46;
+        default:
+            return 0x46;
+    }
+}
+
+extern "C" YZF_RESULT robot_main_camera_sub_seek() {
+    if(STATUS_SUB_SEEKER==Status_BEGIN&&check_motions_finished()&&tick_check+200<armGroup->ProgramTick) {
+        tick_check = armGroup->ProgramTick;
+        camera_handle_id=0;
+        camera_check_count = 3;
+
+        SUB_SEEKER = YZF_FALSE;
+        STATUS_SUB_SEEKER++;
+    }
+
+    //角度校准
+    if (STATUS_SUB_SEEKER == 1 && check_motions_finished()) {
+        mainMenu->cameraInstance->RequestCamera(MapClawTypeToReqCode(seek_claw_type));
+        STATUS_SUB_SEEKER++;
+    }
+    if (STATUS_SUB_SEEKER == 2 && mainMenu->cameraInstance->LockArea->isValid) {
+        if (mainMenu->cameraInstance->LockArea->isSUCCUSS) {
+            cm_lock = mainMenu->cameraInstance->LockArea;
+            if(cm_lock->count>=1){
+                int max = 10000000;
+                for(int i=0;i<cm_lock->count;i++){
+                    int distance=(int)sqrt(pow((cm_lock->Result[i].y-CAMERA_PIXEL_Y/2),2)+pow(abs(cm_lock->Result[i].x+cm_lock->Result[i].w/2-CAMERA_PIXEL_X/2),2));
+                    if(distance < max){
+                        camera_handle_id = i;
+                        max = distance;
+                    }
+                }
+                STATUS_SUB_SEEKER++;
+            }else {
+                STATUS_SUB_SEEKER = 1;
+            }
+        }else {
+            STATUS_SUB_SEEKER = 1;
+        }
+    }
+    if (STATUS_SUB_SEEKER == 3) {
+        int err_x = cm_lock->Result[camera_handle_id].x+cm_lock->Result[camera_handle_id].w/2 - CAMERA_PIXEL_X/2;
+        if (abs(err_x)>CAMERA_PIXEL_X) { //检查数据异常
+            STATUS_SUB_SEEKER = 1;
+        }
+        if (seek_claw_type==NONE_CLAW) {
+            if (strncmp(cm_lock->Result[camera_handle_id].tag,"yuan",4)==0) {
+                seek_claw_type = YUAN;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ti",2)==0) {
+                seek_claw_type = TI;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"si",2)==0) {
+                seek_claw_type = SI;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"san",3)==0) {
+                seek_claw_type = SAN;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ps",2)==0) {
+                seek_claw_type = P_SAN;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ms",2)==0) {
+                seek_claw_type = M_SAN;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"pt",2)==0) {
+                seek_claw_type = P_TI;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"mt",2)==0) {
+                seek_claw_type = M_TI;
+            }
+        }
+
+        float xg;
+        if (fabs(err_x) > sub_dest_x*2.5) {
+            xg= camera_current - sub_kpx*(err_x)*0.3;
+        }else {
+            xg= camera_current - sub_kpx*(err_x);
+        }
+        xg = xg > 40.0f ? 40.0f : xg;
+        xg = xg < -40.0f ? -40.0f : xg;
+        if (abs(err_x)< sub_dest_x) {
+            camera_check_r = xg;
+            tick_check = armGroup->ProgramTick;
+            camera_check_count--;
+            STATUS_SUB_SEEKER++;
+            if (camera_check_count<0) {
+                STATUS_SUB_SEEKER = 5;
+            }
+            return YZF_HANDLER_NOT_FINISH;
+        }
+
+        tick_check = armGroup->ProgramTick;
+        motor_r_controller_angle(xg);
+        camera_current = xg;
+        STATUS_SUB_SEEKER++;
+    }
+    if (STATUS_SUB_SEEKER == 4&& tick_check+300<armGroup->ProgramTick) {
+        STATUS_SUB_SEEKER=1;
+    }
+    if (STATUS_SUB_SEEKER == 5 && check_motions_finished()) {
+        mainMenu->cameraInstance->RequestCamera(MapClawTypeToReqCode(seek_claw_type));
+        STATUS_SUB_SEEKER++;
+    }
+    if (STATUS_SUB_SEEKER == 6 && mainMenu->cameraInstance->LockArea->isValid) {
+        if (mainMenu->cameraInstance->LockArea->isSUCCUSS) {
+            cm_lock = mainMenu->cameraInstance->LockArea;
+            if(cm_lock->count>=1){
+                int max = 10000000;
+                for(int i=0;i<cm_lock->count;i++){
+                    int distance=(int)sqrt(pow((cm_lock->Result[i].y-CAMERA_PIXEL_Y/2),2)+pow(abs(cm_lock->Result[i].x+cm_lock->Result[i].w/2-CAMERA_PIXEL_X/2),2));
+                    if(distance < max){
+                        camera_handle_id = i;
+                        max = distance;
+                    }
+                }
+                STATUS_SUB_SEEKER++;
+            }else {
+                STATUS_SUB_SEEKER = 5;
+            }
+        }else {
+            STATUS_SUB_SEEKER = 5;
+        }
+    }
+    if (STATUS_SUB_SEEKER == 7 && check_motions_finished()) {
+        int err_y = cm_lock->Result[camera_handle_id].y+cm_lock->Result[camera_handle_id].h/2 - CAMERA_PIXEL_Y/2;
+
+        float yg = camera_current_y - sub_kpy*err_y;
+
+        if (abs(err_y)<sub_dest_y) {
+            STATUS_SUB_SEEKER = Status_FINISH;
+            camera_check_y = CAMERA_SEE_POINT_Y+yg*ARM_Y_2_MM;
+            if (strncmp(cm_lock->Result[camera_handle_id].tag,"yuan",4)==0) {
+                claw_type = YUAN;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ti",2)==0) {
+                claw_type = TI;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R < 90) {
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 270.0) {
+                    camera_check_claw_R =360.0f-camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 90.0 &&camera_check_claw_R < 180.0) {
+                    camera_check_claw_R = (180.0f-camera_check_claw_R);
+                    camera_check_second = YZF_TRUE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R >= 180.0 &&camera_check_claw_R <= 270.0) {
+                    camera_check_claw_R =  camera_check_claw_R - 180.0f;
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_TRUE;
+                }
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"si",2)==0) {
+                claw_type = SI;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                while (camera_check_claw_R > 45.0f) {
+                    camera_check_claw_R -= 45.0f;
+                }
+                camera_check_claw_R= -camera_check_claw_R;
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"san",3)==0) {
+                claw_type = SAN;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R >= 180.0f) {
+                    camera_check_claw_R = - (camera_check_claw_R-180.0f);
+                }
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ps",2)==0) {
+                claw_type = P_SAN;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R >= 180.0f) {
+                    camera_check_claw_R = - (camera_check_claw_R-180.0f);
+                }
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"ms",2)==0) {
+                claw_type = SAN;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R >= 180.0f) {
+                    camera_check_claw_R = - (camera_check_claw_R-180.0f);
+                }
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"pt",2)==0) {
+                claw_type = P_TI;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R < 90) {
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 270.0) {
+                    camera_check_claw_R =360.0f-camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 90.0 &&camera_check_claw_R < 180.0) {
+                    camera_check_claw_R = (180.0f-camera_check_claw_R);
+                    camera_check_second = YZF_TRUE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R >= 180.0 &&camera_check_claw_R <= 270.0) {
+                    camera_check_claw_R =  camera_check_claw_R - 180.0f;
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_TRUE;
+                }
+            }else if (strncmp(cm_lock->Result[camera_handle_id].tag,"mt",2)==0) {
+                claw_type = TI;
+                camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence*360;
+                if (camera_check_claw_R < 90) {
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 270.0) {
+                    camera_check_claw_R =360.0f-camera_check_claw_R;
+                    camera_check_second = YZF_FALSE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R > 90.0 &&camera_check_claw_R < 180.0) {
+                    camera_check_claw_R = (180.0f-camera_check_claw_R);
+                    camera_check_second = YZF_TRUE;
+                    return YZF_HANDLER_NOT_FINISH;
+                }
+                if (camera_check_claw_R >= 180.0 &&camera_check_claw_R <= 270.0) {
+                    camera_check_claw_R =  camera_check_claw_R - 180.0f;
+                    camera_check_claw_R = -camera_check_claw_R;
+                    camera_check_second = YZF_TRUE;
+                }
+            }
+            return YZF_HANDLER_NOT_FINISH;
+        }
+
+        tick_check = armGroup->ProgramTick;
+        motor_Stepper_XYZO_setLength(CAMERA_SEE_POINT_X, CAMERA_SEE_POINT_Y+yg*ARM_Y_2_MM,CAMERA_SEE_POINT_Z,0);
+        camera_current_y = yg;
+        STATUS_SUB_SEEKER++;
+    }
+    if (STATUS_SUB_SEEKER == 8 && check_motions_finished()) {
+        STATUS_SUB_SEEKER=5;
+    }
+
+    if(STATUS_SUB_SEEKER==Status_FINISH){
+        STATUS_SUB_SEEKER = Status_BEGIN;
+        SUB_SEEKER =YZF_TRUE;
+        return YZF_OK;
+    }
+    return YZF_HANDLER_NOT_FINISH;
+}
+
+extern "C" YZF_RESULT robot_main_camera_thread() {
+    if(STATUS_CAMERA==Status_BEGIN) {
+        tick_check = armGroup->ProgramTick;
+        camera_check_r = 0;
+        camera_check_y = 0;
+        camera_current = 0;
+        camera_current_y = 0;
+        camera_handle_id = 0;
+        camera_check_x = 0;
+        camera_check_z = 0;
+        camera_check_second = YZF_FALSE;
+        camera_check_claw_R = 0;
+        camera_check_count = 5;
+        camera_finish = YZF_FALSE;
+        seek_claw_type = NONE_CLAW;
+        motor_Stepper_XYZO_setLength(CAMERA_SEE_POINT_X, CAMERA_SEE_POINT_Y,CAMERA_SEE_POINT_Z,0);
+        STATUS_CAMERA=100;
+    }
+    if (STATUS_CAMERA == 100 && tick_check + 6000 < armGroup->ProgramTick) {
+        motor_claw_controller(0.0);
+        STATUS_CAMERA = 1;
+    }
+    if (STATUS_CAMERA == 1)
+    {
+        sub_dest_x = 60;
+        sub_dest_y = 30;
+        sub_kpy = 0.08;
+        sub_kpx = 0.05;
+        STATUS_SUB_SEEKER = Status_BEGIN;
+        SUB_SEEKER =YZF_FALSE;
+        yzf_global_handler_add(robot_main_camera_sub_seek);
+        STATUS_CAMERA++;
+    }
+    if (STATUS_CAMERA == 2 && SUB_SEEKER)
+    {
+        sub_dest_x = 18;
+        sub_dest_y = 8;
+        sub_kpy = 0.02;
+        sub_kpx = 0.035;
+        STATUS_SUB_SEEKER = Status_BEGIN;
+        SUB_SEEKER =YZF_FALSE;
+        yzf_global_handler_add(robot_main_camera_sub_seek);
+        STATUS_CAMERA++;
+    }
+    if (STATUS_CAMERA == 3 && SUB_SEEKER)
+    {
+        STATUS_CAMERA = Status_FINISH;
+    }
+    if(STATUS_CAMERA==Status_FINISH){
+        STATUS_CAMERA = Status_BEGIN;
+        camera_finish =YZF_TRUE;
+        return YZF_OK;
+    }
+    return YZF_HANDLER_NOT_FINISH;
+}
+
+移动x,y在同一方向上，可视为朝同一方向移动，r为底盘旋转，现在考虑使用贝叶斯滤波，在索引前先行滤波，cm_lock->Result[camera_handle_id].confidence实际为角度，后也可改为置信度，角度另行获取。
+
+讨论一下贝叶斯滤波方案
+
+
+
+======================================= AI =======================================
+
+你这问题其实很清楚：**摄像头识别有噪声，尤其在材质和形状上容易出错，你想在拿到 tag 之前先用贝叶斯滤波把结果稳一稳**。
+咱们用日常语言捋一下可以怎么做。
+
+---
+
+### 1. 你要滤波的到底是什么
+现在的情况是：
+- 一次请求返回多个目标（`cm_lock->Result[]`）
+- 每次你挑一个最靠近图像中心的
+- 那个目标的 `tag` 会告诉你“是什么形状+什么材质”
+- 但 `tag` **本身可能出错**（材质错 40%，形状错 15%）
+
+所以**滤波对象不是坐标，而是“这个物块到底是哪种类型”**。
+
+---
+
+### 2. 贝叶斯滤波的思路（用大白话说）
+贝叶斯滤波就是：
+> 我先猜你是某种类型，然后每次看到新观测，就用“这个观测有多靠谱”来更新我的猜测。
+
+你可以这样建模：
+
+#### 状态（你要估计的东西）
+一共 6 种物块类型：
+```text
+YUAN, SI, M_TI, P_TI, M_SAN, P_SAN
+```
+
+#### 观测（摄像头给你的东西）
+每次摄像头返回一个 `tag` 字符串，可以映射为 8 种标签之一（你代码里那串 `strncmp` 的判断结果）。
+
+---
+
+### 3. 两步走：预测 + 更新
+
+你这里物块不会自己变类型，所以**预测步非常简单：状态保持不变**。
+
+更新步就是贝叶斯公式的核心：
+> 后验概率 ∝ 似然 × 先验概率
+
+写成代码感觉就是：
+```text
+for 每种类型 type：
+    后验[type] = 似然(观测_tag | 真实_type) × 先验[type]
+然后归一化
+```
+
+---
+
+### 4. 似然怎么定（关键）
+你需要一张**混淆表**，就是：
+> 当真实类型是 X 时，摄像头报出 tag Y 的概率是多少。
+
+你可以用你手里的错误率大致估算，例如：
+
+**材质在中心区域错 40%**，可以近似成：
+- 如果真实是 M_TI，摄像头报成 P_TI 的概率 ≈ 0.4
+- 报成 M_TI 的概率 ≈ 0.6
+
+**形状错 15%**，可以近似成：
+- 真实是 TI，被报成 SAN 之类的概率 ≈ 0.15
+
+你可以先手工填一个简单版，比如：
+
+| 真实 \ 观测 | M_TI | P_TI | M_SAN | P_SAN | YUAN | SI |
+|-------------|------|------|-------|-------|------|----|
+| M_TI        | 0.55 | 0.35 | 0.05  | 0.03  | 0.01 | 0.01 |
+| P_TI        | 0.35 | 0.55 | 0.03  | 0.05  | 0.01 | 0.01 |
+| …           | …    | …    | …     | …     | …    | …   |
+
+如果你后面把 `confidence` 改成“置信度”，可以把置信度当作**似然的缩放因子**：
+比如 `confidence` 高的时候，混淆概率降低；`confidence` 低时，混淆概率升高。
+
+---
+
+### 5. 怎么嵌入你现有流程
+你现在是：
+1. 请求摄像头 → 得到 `cm_lock`
+2. 挑最近目标的 `tag`
+3. 用一串 `strncmp` 决定 `claw_type`
+
+改成：
+1. 请求摄像头 → 得到 `cm_lock`
+2. 挑最近目标
+3. **拿 `tag` 做一次贝叶斯更新**
+4. 取后验概率最大的类型作为 `claw_type`（或概率超过阈值才采信）
+
+伪代码像这样：
+```text
+观测_tag = cm_lock->Result[id].tag 映射为观测类型
+
+// 更新
+for each 真实类型 type：
+    后验[type] *= 似然[观测类型][真实类型]
+归一化后验
+
+当前估计类型 = argmax(后验)
+```
+
+---
+
+### 6. 多帧优势
+贝叶斯的好处是**越看越准**——
+你第一次可能还分不清 M_TI 和 P_TI，但连续看 3 次，只要似然矩阵不太离谱，后验会快速收敛到正确类型。
+
+你代码里已经有重复请求的机制（`camera_check_count`），正好可以在每次拿到结果时调一次贝叶斯更新。
+
+---
+
+### 7. 避坑提醒
+- 如果目标换了（比如机械臂移动到了新物块上方），**先验要重置**为均匀分布。
+- 归一化别忘了，不然数值会飘。
+- 如果连续多次后验最大值仍低于某个阈值（比如 0.7），可以判定“不确定”，触发重试或人工干预。
+
+---
+
+如果你愿意，下一步我可以帮你：
+- 写一个具体的 C 语言贝叶斯更新函数伪代码
+- 或者帮你根据你现有的错误率，推一个更合理的似然矩阵
+你更想要哪个？
+
+
+======================================= 回复 =======================================
+
+可以先拟定一个C语言代码，抽象出更新接口即可，无需考虑数据获取逻辑，需要初始化函数
+
+======================================= AI 回复 =======================================
+
+好的，我给你写一个简洁的贝叶斯滤波器，只负责概率更新，不碰你的硬件逻辑。
+
+```c
+// bayes_filter.h
+#ifndef BAYES_FILTER_H
+#define BAYES_FILTER_H
+
+// 6种真实类型
+typedef enum {
+    REAL_YUAN = 0,
+    REAL_SI,
+    REAL_M_TI,
+    REAL_P_TI,
+    REAL_M_SAN,
+    REAL_P_SAN,
+    REAL_TYPE_COUNT
+} RealType;
+
+// 摄像头可能返回的观测标签（你代码里strncmp判断的那些）
+typedef enum {
+    OBS_YUAN = 0,
+    OBS_SI,
+    OBS_TI,      // 不分材质的TI
+    OBS_SAN,     // 不分材质的SAN
+    OBS_MT,      // "mt" -> M_TI
+    OBS_PT,      // "pt" -> P_TI
+    OBS_MS,      // "ms" -> M_SAN
+    OBS_PS,      // "ps" -> P_SAN
+    OBS_COUNT
+} ObsType;
+
+// 滤波器结构体
+typedef struct {
+    float belief[REAL_TYPE_COUNT];  // 当前信念（后验概率）
+} BayesFilter;
+
+// 初始化，设为均匀分布
+void bayes_init(BayesFilter *f);
+
+// 输入一次观测，更新信念
+// obs:        本次摄像头返回的观测类型
+// confidence: 摄像头给的置信度（0~1），暂时预留，后面可用来缩放似然
+void bayes_update(BayesFilter *f, ObsType obs, float confidence);
+
+// 获取当前最可能的类型（后验概率最大的）
+RealType bayes_get_best(const BayesFilter *f);
+
+// 获取指定类型的当前概率
+float bayes_get_prob(const BayesFilter *f, RealType type);
+
+// 重置为均匀分布（切换目标时调用）
+void bayes_reset(BayesFilter *f);
+
+#endif
+```
+
+```c
+// bayes_filter.c
+#include "bayes_filter.h"
+#include <string.h>  // memset
+
+// ============ 似然矩阵 ============
+// likelihood[观测类型][真实类型] = P(观测|真实)
+// 根据你给的错误率手工估算，后面可以调
+static const float likelihood[OBS_COUNT][REAL_TYPE_COUNT] = {
+    // YUAN, SI, M_TI, P_TI, M_SAN, P_SAN
+    { 0.85, 0.03, 0.03, 0.03, 0.03, 0.03 },  // OBS_YUAN
+    { 0.03, 0.85, 0.03, 0.03, 0.03, 0.03 },  // OBS_SI
+    { 0.02, 0.02, 0.45, 0.40, 0.05, 0.06 },  // OBS_TI (不分材质)
+    { 0.02, 0.02, 0.05, 0.06, 0.45, 0.40 },  // OBS_SAN (不分材质)
+    { 0.02, 0.02, 0.55, 0.35, 0.04, 0.02 },  // OBS_MT (明确报金属TI)
+    { 0.02, 0.02, 0.35, 0.55, 0.02, 0.04 },  // OBS_PT (明确报塑料TI)
+    { 0.02, 0.02, 0.04, 0.02, 0.55, 0.35 },  // OBS_MS (明确报金属SAN)
+    { 0.02, 0.02, 0.02, 0.04, 0.35, 0.55 },  // OBS_PS (明确报塑料SAN)
+};
+
+// ============ 初始化 ============
+void bayes_init(BayesFilter *f) {
+    float uniform = 1.0f / REAL_TYPE_COUNT;
+    for (int i = 0; i < REAL_TYPE_COUNT; i++) {
+        f->belief[i] = uniform;
+    }
+}
+
+// ============ 核心更新 ============
+void bayes_update(BayesFilter *f, ObsType obs, float confidence) {
+    float new_belief[REAL_TYPE_COUNT];
+    float sum = 0.0f;
+
+    // 贝叶斯更新：后验 ∝ 似然 × 先验
+    for (int real = 0; real < REAL_TYPE_COUNT; real++) {
+        float like = likelihood[obs][real];
+        // confidence暂时预留，后面可以用来缩放似然:
+        // like = like * confidence + 均匀分布 * (1 - confidence)
+        // 表示"摄像头越不确定，越接近瞎猜"
+        new_belief[real] = like * f->belief[real];
+        sum += new_belief[real];
+    }
+
+    // 归一化
+    if (sum > 0.0f) {
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < REAL_TYPE_COUNT; i++) {
+            f->belief[i] = new_belief[i] * inv_sum;
+        }
+    } else {
+        // 数值异常，重置为均匀分布
+        bayes_reset(f);
+    }
+}
+
+// ============ 查询接口 ============
+RealType bayes_get_best(const BayesFilter *f) {
+    int best = 0;
+    for (int i = 1; i < REAL_TYPE_COUNT; i++) {
+        if (f->belief[i] > f->belief[best]) {
+            best = i;
+        }
+    }
+    return (RealType)best;
+}
+
+float bayes_get_prob(const BayesFilter *f, RealType type) {
+    return f->belief[type];
+}
+
+void bayes_reset(BayesFilter *f) {
+    bayes_init(f);  // 重新均匀分布
+}
+```
+
+---
+
+### 怎么嵌进你的代码（伪代码示意）
+
+```c
+// 在你的状态机外面定义：
+BayesFilter bayes;
+
+// 初始化（程序启动或切换目标时调一次）：
+bayes_init(&bayes);
+
+// 在你拿到 tag 判断完之后，比如 STATUS_SUB_SEEKER == 3 里面：
+ObsType obs;
+if (strncmp(tag, "yuan", 4)==0)      obs = OBS_YUAN;
+else if (strncmp(tag, "si", 2)==0)   obs = OBS_SI;
+else if (strncmp(tag, "ti", 2)==0)   obs = OBS_TI;
+else if (strncmp(tag, "san", 3)==0)  obs = OBS_SAN;
+else if (strncmp(tag, "mt", 2)==0)   obs = OBS_MT;
+else if (strncmp(tag, "pt", 2)==0)   obs = OBS_PT;
+else if (strncmp(tag, "ms", 2)==0)   obs = OBS_MS;
+else if (strncmp(tag, "ps", 2)==0)   obs = OBS_PS;
+
+// 更新信念
+float conf = cm_lock->Result[id].confidence;  // 暂用，后面可改
+bayes_update(&bayes, obs, conf);
+
+// 取最优估计
+RealType best = bayes_get_best(&bayes);
+float best_prob = bayes_get_prob(&bayes, best);
+
+// 只有概率够高才采信
+if (best_prob > 0.7f) {
+    switch (best) {
+        case REAL_YUAN:  claw_type = YUAN;   break;
+        case REAL_SI:    claw_type = SI;     break;
+        case REAL_M_TI:  claw_type = M_TI;   break;
+        case REAL_P_TI:  claw_type = P_TI;   break;
+        case REAL_M_SAN: claw_type = M_SAN;  break;
+        case REAL_P_SAN: claw_type = P_SAN;  break;
+    }
+}
+```
+
+---
+
+### 说明
+- **似然矩阵**里，材质混淆概率设得比较高（M↔P 约35%~40%），形状混淆较低（约15%），和你的描述一致。
+- `confidence` 参数目前只是预留，你后面把 `confidence` 改成真实置信度后，可以把 `like = like * confidence + 均匀分布 * (1 - confidence)` 那行打开，这样摄像头越不确定，更新越保守。
+- 切换目标时记得调 `bayes_reset()`，否则会带着上一轮的信念影响新目标。
+
+需要我帮你调似然矩阵的具体数值，或者加上“置信度缩放”那部分吗？
+
+======================================= 回复 =======================================
+
+是的，我需要了解如何进行置信度缩放
+
+======================================= AI 回复 =======================================
+
+好的，置信度缩放的核心思想是：**摄像头告诉你它有多确定，你就按这个比例混合"有信息的似然"和"完全瞎猜的均匀分布"**。
+
+---
+
+## 直观理解
+
+假设摄像头说"这是 M_TI，但我只有 60% 的把握"：
+
+- **60% 的可能**：按似然矩阵来，M_TI 给高分，P_TI 也给一些分（材质混淆）
+- **40% 的可能**：摄像头其实在瞎猜，什么类型都有可能，应该用均匀分布
+
+把这两者加权平均，就是缩放后的似然。
+
+---
+
+## 具体做法
+
+原始更新公式：
+```c
+new_belief[real] = likelihood[obs][real] * belief[real];
+```
+
+加上置信度缩放后变成：
+```c
+scaled_like = confidence × likelihood[obs][real] + (1 - confidence) × (1/6)
+new_belief[real] = scaled_like × belief[real];
+```
+
+其中 `1/6` 是均匀分布的概率（6种类型）。
+
+---
+
+## 完整代码
+
+我只改 `bayes_update` 这一个函数：
+
+```c
+void bayes_update(BayesFilter *f, ObsType obs, float confidence) {
+    float new_belief[REAL_TYPE_COUNT];
+    float sum = 0.0f;
+    float uniform = 1.0f / REAL_TYPE_COUNT;  // 均匀分布 ≈ 0.167
+
+    // 限制 confidence 在有效范围
+    if (confidence < 0.0f) confidence = 0.0f;
+    if (confidence > 1.0f) confidence = 1.0f;
+
+    for (int real = 0; real < REAL_TYPE_COUNT; real++) {
+        // 核心：置信度缩放
+        float scaled_like = confidence * likelihood[obs][real]
+                          + (1.0f - confidence) * uniform;
+
+        new_belief[real] = scaled_like * f->belief[real];
+        sum += new_belief[real];
+    }
+
+    // 归一化
+    if (sum > 1e-10f) {
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < REAL_TYPE_COUNT; i++) {
+            f->belief[i] = new_belief[i] * inv_sum;
+        }
+    } else {
+        bayes_reset(f);
+    }
+}
+```
+
+---
+
+## 效果对比（举例）
+
+假设当前信念均匀，摄像头报 `OBS_MT`（明确说是金属TI）：
+
+### 情况1：confidence = 1.0（完全信任）
+```
+P(M_TI)  = 0.55  ← 似然矩阵原值
+P(P_TI)  = 0.35
+P(其他)  ≈ 0.02~0.04
+```
+和原来一样。
+
+### 情况2：confidence = 0.6（60%把握）
+```
+P(M_TI)  = 0.6×0.55 + 0.4×0.167 = 0.397
+P(P_TI)  = 0.6×0.35 + 0.4×0.167 = 0.277
+P(其他)  = 0.6×0.02 + 0.4×0.167 = 0.079
+```
+材质间的差距变小了，滤波更保守。
+
+### 情况3：confidence = 0.0（完全不确定）
+```
+所有类型 ≈ 0.167
+```
+等于什么都没学到，保持原有信念不变。
+
+---
+
+## 什么情况下效果明显
+
+- **高置信度观测**：快速收敛，像你现在代码里连续看3次就能确定类型
+- **低置信度观测**：不会"带偏"滤波器，需要多看几次才能确信
+- **连续错误观测**：如果摄像头连续报错，低置信度时伤害更小，滤波器不会轻易被带跑
+
+---
+
+## 怎么获取置信度
+
+你现在这行：
+```c
+camera_check_claw_R = cm_lock->Result[camera_handle_id].confidence * 360;
+```
+
+说明 `confidence` 字段现在存的是角度相关的东西。如果要改成置信度，有两种方式：
+
+### 方式A：用目标到图像中心的距离
+```c
+float conf = 1.0f - (float)distance / 400.0f;  // 越近越可信
+if (conf < 0.0f) conf = 0.0f;
+```
+
+### 方式B：如果摄像头本身能输出置信度
+那就直接用，比如 `cm_lock->Result[id].confidence` 如果本身就是 0~1 的数。
+
+---
+
+## 额外建议：自适应停止条件
+
+你现在是固定看 3 次（`camera_check_count`），有了概率之后可以改成：
+
+```c
+if (bayes_get_prob(&bayes, bayes_get_best(&bayes)) > 0.85f) {
+    // 很确定了，不用再看那么多次
+    camera_check_count = 0;  // 提前结束
+}
+```
+
+---
+
+需要我帮你把似然矩阵也根据置信度缩放做一个可调参数版本吗？比如加一个"最大混淆率"参数来控制材质识别的不可靠程度。
+
+======================================= 回复 =======================================
+
+我是否可以根据其离中心的距离，动态更新其likelihood，我可能需要一个实例代码
+
+======================================= AI 回复 =======================================
+
+完全可以，而且这个思路很好。既然你知道**离中心越远材质越容易错**，那就让似然矩阵"活"起来。
+
+核心思路：
+- 物块在中心（`dist=0`）：用原始似然矩阵，材质混淆率 40%
+- 物块远离中心（`dist > 80`）：材质混淆率接近 50%（纯瞎猜），形状混淆率也略微升高
+- 中间状态：线性插值
+
+---
+
+## 完整代码
+
+```c
+// bayes_filter.h 新增
+#ifndef BAYES_FILTER_H
+#define BAYES_FILTER_H
+
+typedef enum {
+    REAL_YUAN = 0,
+    REAL_SI,
+    REAL_M_TI,
+    REAL_P_TI,
+    REAL_M_SAN,
+    REAL_P_SAN,
+    REAL_TYPE_COUNT
+} RealType;
+
+typedef enum {
+    OBS_YUAN = 0,
+    OBS_SI,
+    OBS_TI,
+    OBS_SAN,
+    OBS_MT,
+    OBS_PT,
+    OBS_MS,
+    OBS_PS,
+    OBS_COUNT
+} ObsType;
+
+typedef struct {
+    float belief[REAL_TYPE_COUNT];
+    float dynamic_likelihood[OBS_COUNT][REAL_TYPE_COUNT]; // 动态似然，每次更新时重算
+} BayesFilter;
+
+void bayes_init(BayesFilter *f);
+void bayes_update(BayesFilter *f, ObsType obs, float confidence, float distance_to_center);
+RealType bayes_get_best(const BayesFilter *f);
+float bayes_get_prob(const BayesFilter *f, RealType type);
+void bayes_reset(BayesFilter *f);
+
+#endif
+```
+
+```c
+// bayes_filter.c
+#include "bayes_filter.h"
+#include <math.h>   // fminf, fmaxf
+
+// ============ 基础似然矩阵（物块在中心时的值） ============
+// 行：观测类型，列：真实类型
+static const float base_likelihood[OBS_COUNT][REAL_TYPE_COUNT] = {
+    // YUAN,   SI,  M_TI,  P_TI, M_SAN, P_SAN
+    { 0.85, 0.03, 0.03, 0.03, 0.03, 0.03 },  // OBS_YUAN
+    { 0.03, 0.85, 0.03, 0.03, 0.03, 0.03 },  // OBS_SI
+    { 0.02, 0.02, 0.45, 0.40, 0.05, 0.06 },  // OBS_TI (不分材质)
+    { 0.02, 0.02, 0.05, 0.06, 0.45, 0.40 },  // OBS_SAN (不分材质)
+    { 0.02, 0.02, 0.55, 0.35, 0.04, 0.02 },  // OBS_MT (明确金属TI)
+    { 0.02, 0.02, 0.35, 0.55, 0.02, 0.04 },  // OBS_PT (明确塑料TI)
+    { 0.02, 0.02, 0.04, 0.02, 0.55, 0.35 },  // OBS_MS (明确金属SAN)
+    { 0.02, 0.02, 0.02, 0.04, 0.35, 0.55 },  // OBS_PS (明确塑料SAN)
+};
+
+// ============ 参数 ============
+#define CRITICAL_DISTANCE  80.0f   // 超过这个距离，材质完全不可靠
+#define MAX_MATERIAL_ERROR 0.48f   // 最差情况材质混淆率（接近瞎猜的0.5）
+#define MAX_SHAPE_ERROR    0.25f   // 最差情况形状错误率（比中心高10%）
+
+// ============ 辅助函数：判断两个类型是否材质相同、形状相同 ============
+static int same_material(RealType a, RealType b) {
+    // 金属组
+    if ((a == REAL_M_TI || a == REAL_M_SAN) &&
+        (b == REAL_M_TI || b == REAL_M_SAN)) return 1;
+    // 塑料组
+    if ((a == REAL_P_TI || a == REAL_P_SAN) &&
+        (b == REAL_P_TI || b == REAL_P_SAN)) return 1;
+    // 圆和方没有材质概念，只和自己相同
+    return (a == b);
+}
+
+static int same_shape(RealType a, RealType b) {
+    // 圆
+    if (a == REAL_YUAN && b == REAL_YUAN) return 1;
+    // 方
+    if (a == REAL_SI   && b == REAL_SI)   return 1;
+    // 三角类（TI/SAN 都算三角）
+    if ((a == REAL_M_TI || a == REAL_P_TI || a == REAL_M_SAN || a == REAL_P_SAN) &&
+        (b == REAL_M_TI || b == REAL_P_TI || b == REAL_M_SAN || b == REAL_P_SAN)) return 1;
+    return 0;
+}
+
+// ============ 核心：根据距离重建似然矩阵 ============
+static void rebuild_likelihood(BayesFilter *f, ObsType obs, float distance) {
+    float uniform = 1.0f / REAL_TYPE_COUNT;
+
+    // 距离归一化：0=中心，1=临界距离或更远
+    float t = fminf(distance / CRITICAL_DISTANCE, 1.0f);
+
+    // 当前距离下的混淆率
+    float mat_error  = 0.05f + t * (MAX_MATERIAL_ERROR - 0.05f);  // 5%→48%
+    float shape_error = 0.02f + t * (MAX_SHAPE_ERROR - 0.02f);    // 2%→25%
+
+    // 真实类型：遍历所有可能
+    for (int real = 0; real < REAL_TYPE_COUNT; real++) {
+        float sum_other_material = 0.0f;  // 材质不同但形状相同的概率总和
+        float sum_other_shape    = 0.0f;  // 形状不同但材质相同的概率总和
+        float sum_other_both     = 0.0f;  // 材质形状都不同的概率总和
+        int   count_other_mat = 0, count_other_shape = 0, count_other_both = 0;
+
+        // 统计各类"错误目标"的数量
+        for (int r = 0; r < REAL_TYPE_COUNT; r++) {
+            if (r == real) continue;
+            int mat_same  = same_material((RealType)r, (RealType)real);
+            int shap_same = same_shape((RealType)r, (RealType)real);
+
+            if (!mat_same && shap_same)  count_other_mat++;   // 材质错、形状对
+            else if (mat_same && !shap_same) count_other_shape++; // 形状错、材质对
+            else if (!mat_same && !shap_same) count_other_both++;  // 都错
+        }
+
+        // 分配错误概率
+        float prob_other_mat   = (count_other_mat   > 0) ? mat_error  / count_other_mat   : 0.0f;
+        float prob_other_shape = (count_other_shape > 0) ? shape_error / count_other_shape : 0.0f;
+        float prob_other_both  = (count_other_both  > 0) ? (mat_error * shape_error) / count_other_both : 0.0f;
+
+        // 填充这一列
+        for (int r = 0; r < REAL_TYPE_COUNT; r++) {
+            if (r == real) {
+                // 正确的概率 = 1 - 所有错误概率
+                f->dynamic_likelihood[obs][real] = 1.0f -
+                    (count_other_mat   * prob_other_mat) -
+                    (count_other_shape * prob_other_shape) -
+                    (count_other_both  * prob_other_both);
+            } else {
+                int mat_same  = same_material((RealType)r, (RealType)real);
+                int shap_same = same_shape((RealType)r, (RealType)real);
+
+                if (!mat_same && shap_same)
+                    f->dynamic_likelihood[obs][r] = prob_other_mat;
+                else if (mat_same && !shap_same)
+                    f->dynamic_likelihood[obs][r] = prob_other_shape;
+                else if (!mat_same && !shap_same)
+                    f->dynamic_likelihood[obs][r] = prob_other_both;
+                else
+                    f->dynamic_likelihood[obs][r] = 0.0f;  // 不应该到这里
+            }
+        }
+    }
+}
+
+// ============ 初始化 ============
+void bayes_init(BayesFilter *f) {
+    float uniform = 1.0f / REAL_TYPE_COUNT;
+    for (int i = 0; i < REAL_TYPE_COUNT; i++) {
+        f->belief[i] = uniform;
+    }
+    // 初始化似然为基值
+    for (int o = 0; o < OBS_COUNT; o++) {
+        for (int r = 0; r < REAL_TYPE_COUNT; r++) {
+            f->dynamic_likelihood[o][r] = base_likelihood[o][r];
+        }
+    }
+}
+
+// ============ 更新接口 ============
+void bayes_update(BayesFilter *f, ObsType obs, float confidence, float distance_to_center) {
+    // 1. 根据距离重建当前观测对应的似然
+    rebuild_likelihood(f, obs, distance_to_center);
+
+    // 2. 贝叶斯更新（和之前一样，但用 dynamic_likelihood）
+    float new_belief[REAL_TYPE_COUNT];
+    float sum = 0.0f;
+    float uniform = 1.0f / REAL_TYPE_COUNT;
+
+    if (confidence < 0.0f) confidence = 0.0f;
+    if (confidence > 1.0f) confidence = 1.0f;
+
+    for (int real = 0; real < REAL_TYPE_COUNT; real++) {
+        // 置信度缩放
+        float scaled_like = confidence * f->dynamic_likelihood[obs][real]
+                          + (1.0f - confidence) * uniform;
+        new_belief[real] = scaled_like * f->belief[real];
+        sum += new_belief[real];
+    }
+
+    // 归一化
+    if (sum > 1e-10f) {
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < REAL_TYPE_COUNT; i++) {
+            f->belief[i] = new_belief[i] * inv_sum;
+        }
+    } else {
+        bayes_reset(f);
+    }
+}
+
+// ============ 查询 ============
+RealType bayes_get_best(const BayesFilter *f) {
+    int best = 0;
+    for (int i = 1; i < REAL_TYPE_COUNT; i++) {
+        if (f->belief[i] > f->belief[best]) {
+            best = i;
+        }
+    }
+    return (RealType)best;
+}
+
+float bayes_get_prob(const BayesFilter *f, RealType type) {
+    return f->belief[type];
+}
+
+void bayes_reset(BayesFilter *f) {
+    bayes_init(f);
+}
+```
+
+---
+
+## 在你的代码里怎么用
+
+```c
+// 原来你选目标的距离：
+int distance = (int)sqrt(pow((y - CAMERA_PIXEL_Y/2), 2) +
+                         pow((x + w/2 - CAMERA_PIXEL_X/2), 2));
+
+// 拿到 tag 和置信度：
+ObsType obs = ...;  // 你的 strncmp 映射
+float conf = 1.0f - (float)distance / 400.0f;  // 或用摄像头自带的
+if (conf < 0.0f) conf = 0.0f;
+
+// 更新（distance 直接传像素距离）
+bayes_update(&bayes, obs, conf, (float)distance);
+```
+
+---
+
+## 效果举例
+
+| 距离 | 材质混淆率 | 形状混淆率 | 行为 |
+|------|-----------|-----------|------|
+| 0~20px | 5%~12% | 2%~5% | 很可信，快速收敛 |
+| 40px | ~22% | ~12% | 适度保守 |
+| 80px | 48% | 25% | 材质几乎不可信，主要靠形状 |
+| >80px | 48% | 25% | 封顶，不再恶化 |
+
+这样滤波器会自动判断：**距离远的时候，材质信息权重自动降低，主要靠形状和多次观测来确认类型**。
+
+
+======================================= 回复 =======================================
+
+
+因为屏幕会同时存在并返回多个目标（最多6个），所以现在输入有如下输入结构体
+typedef struct {
+    YZF_BOOL isValid;
+    YZF_BOOL isSUCCUSS;
+    int count;
+    CameraDetectResult *Result;
+} CameraRequestLock;
+
+附加
+typedef struct {
+    int x;
+    int y;
+    int w;
+    int h;
+    char tag[20];
+    float confidence;
+    float angle;//[0-1]
+} CameraDetectResult;
+
+现在仅通过x,y,w,h，在同一次请求中合并重复的yolo识别框(如果存在大范围重叠，二分之一以上)，已知目标在多次检测中不会大范围移动（仅存在yolo多次识别间的波动），你现在要维护一个多个目标概率实体构成的屏幕状态结构体（你来定义），输入为多个逐次输入的CameraRequestLock结构体，并附上初始化函数。
+
+
+======================================= AI 回复 =======================================
+
+
+好的，你需要维护屏幕上多个目标的概率状态，同时处理YOLO的重叠框合并。我来设计完整的结构体和逻辑。
+
+---
+
+## 头文件
+
+```c
+// screen_tracker.h
+#ifndef SCREEN_TRACKER_H
+#define SCREEN_TRACKER_H
+
+#include "bayes_filter.h"  // 你之前的贝叶斯滤波器
+#include <stdbool.h>
+
+// ============ 屏幕上的一个跟踪目标 ============
+typedef struct {
+    int id;                     // 唯一ID，用于追踪
+    bool active;                // 是否活跃（当前帧有观测）
+
+    // 位置信息（滤波后的）
+    float x, y;                 // 左上角
+    float w, h;                 // 宽高
+    float center_x, center_y;   // 中心点
+
+    // 贝叶斯滤波器（这个目标的类型概率）
+    BayesFilter type_filter;
+
+    // 统计
+    int observe_count;          // 被观测到的次数
+    int miss_count;             // 连续丢失次数
+    float last_confidence;      // 最近一次置信度
+} TrackedTarget;
+
+// ============ 屏幕状态 ============
+#define MAX_TARGETS 6
+
+typedef struct {
+    TrackedTarget targets[MAX_TARGETS];
+    int target_count;           // 当前活跃目标数
+    int next_id;                // 下一个分配的ID
+} ScreenState;
+
+// ============ 初始化 ============
+void screen_init(ScreenState *state);
+
+// ============ 核心更新接口 ============
+// 输入一帧的CameraRequestLock，更新屏幕状态
+// 返回本次更新后有多少个活跃目标
+int screen_update(ScreenState *state, CameraRequestLock *lock);
+
+// ============ 查询接口 ============
+// 获取离屏幕中心最近的目标
+TrackedTarget* screen_get_center_target(ScreenState *state, int screen_w, int screen_h);
+
+// 获取指定ID的目标
+TrackedTarget* screen_get_by_id(ScreenState *state, int id);
+
+// 获取最可能的目标类型（综合概率最高的活跃目标）
+TrackedTarget* screen_get_best_target(ScreenState *state);
+
+#endif
+```
+
+---
+
+## 实现文件
+
+```c
+// screen_tracker.c
+#include "screen_tracker.h"
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+
+// ============ 重叠判断参数 ============
+#define OVERLAP_THRESHOLD  0.5f    // IoU超过这个就算同一目标
+#define MAX_DISTANCE       100.0f  // 中心点距离超过这个就算不同目标（即使IoU不够）
+#define MISS_TIMEOUT       3       // 连续丢失3帧就移除目标
+
+// ============ 辅助：两个框的IoU ============
+static float calc_iou(float x1, float y1, float w1, float h1,
+                       float x2, float y2, float w2, float h2) {
+    // 计算交集
+    float inter_x1 = fmaxf(x1, x2);
+    float inter_y1 = fmaxf(y1, y2);
+    float inter_x2 = fminf(x1 + w1, x2 + w2);
+    float inter_y2 = fminf(y1 + h1, y2 + h2);
+
+    float inter_w = fmaxf(0.0f, inter_x2 - inter_x1);
+    float inter_h = fmaxf(0.0f, inter_y2 - inter_y1);
+    float inter_area = inter_w * inter_h;
+
+    if (inter_area <= 0.0f) return 0.0f;
+
+    float area1 = w1 * h1;
+    float area2 = w2 * h2;
+    float union_area = area1 + area2 - inter_area;
+
+    return inter_area / union_area;
+}
+
+// ============ 辅助：两个框中心距离 ============
+static float calc_center_distance(float x1, float y1, float w1, float h1,
+                                   float x2, float y2, float w2, float h2) {
+    float cx1 = x1 + w1 / 2.0f;
+    float cy1 = y1 + h1 / 2.0f;
+    float cx2 = x2 + w2 / 2.0f;
+    float cy2 = y2 + h2 / 2.0f;
+    return sqrtf((cx1 - cx2) * (cx1 - cx2) + (cy1 - cy2) * (cy1 - cy2));
+}
+
+// ============ 辅助：合并两个框（取平均） ============
+static void merge_boxes(float x1, float y1, float w1, float h1,
+                         float x2, float y2, float w2, float h2,
+                         float *mx, float *my, float *mw, float *mh) {
+    *mx = (x1 + x2) / 2.0f;
+    *my = (y1 + y2) / 2.0f;
+    *mw = (w1 + w2) / 2.0f;
+    *mh = (h1 + h2) / 2.0f;
+}
+
+// ============ 辅助：从tag映射到观测类型 ============
+static ObsType tag_to_obs(const char *tag) {
+    if (strncmp(tag, "yuan", 4) == 0) return OBS_YUAN;
+    if (strncmp(tag, "si", 2) == 0)   return OBS_SI;
+    if (strncmp(tag, "mt", 2) == 0)   return OBS_MT;
+    if (strncmp(tag, "pt", 2) == 0)   return OBS_PT;
+    if (strncmp(tag, "ms", 2) == 0)   return OBS_MS;
+    if (strncmp(tag, "ps", 2) == 0)   return OBS_PS;
+    if (strncmp(tag, "ti", 2) == 0)   return OBS_TI;
+    if (strncmp(tag, "san", 3) == 0)  return OBS_SAN;
+    return OBS_YUAN; // 默认
+}
+
+// ============ 初始化 ============
+void screen_init(ScreenState *state) {
+    state->target_count = 0;
+    state->next_id = 0;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        state->targets[i].active = false;
+        state->targets[i].id = -1;
+        state->targets[i].observe_count = 0;
+        state->targets[i].miss_count = 0;
+        bayes_init(&state->targets[i].type_filter);
+    }
+}
+
+// ============ 核心：合并同一帧的重叠框 ============
+static int merge_frame_detections(CameraDetectResult *results, int count,
+                                   CameraDetectResult *merged, int max_merged) {
+    bool used[16] = {false};  // 假设count不会超过16
+    int merged_count = 0;
+
+    for (int i = 0; i < count && merged_count < max_merged; i++) {
+        if (used[i]) continue;
+
+        // 当前框作为种子
+        float mx = (float)results[i].x;
+        float my = (float)results[i].y;
+        float mw = (float)results[i].w;
+        float mh = (float)results[i].h;
+        int merge_num = 1;
+
+        // 找所有和它重叠的框
+        for (int j = i + 1; j < count; j++) {
+            if (used[j]) continue;
+
+            float iou = calc_iou(mx, my, mw, mh,
+                                 (float)results[j].x, (float)results[j].y,
+                                 (float)results[j].w, (float)results[j].h);
+
+            if (iou >= OVERLAP_THRESHOLD) {
+                // 合并：加权平均（按面积加权更好，这里简化为直接平均）
+                float new_mx, new_my, new_mw, new_mh;
+                merge_boxes(mx, my, mw, mh,
+                            (float)results[j].x, (float)results[j].y,
+                            (float)results[j].w, (float)results[j].h,
+                            &new_mx, &new_my, &new_mw, &new_mh);
+                mx = new_mx; my = new_my; mw = new_mw; mh = new_mh;
+                merge_num++;
+                used[j] = true;
+            }
+        }
+
+        // 保存合并结果
+        merged[merged_count].x = (int)mx;
+        merged[merged_count].y = (int)my;
+        merged[merged_count].w = (int)mw;
+        merged[merged_count].h = (int)mh;
+
+        // tag取第一个框的（合并的框应该类型相同）
+        strncpy(merged[merged_count].tag, results[i].tag, 19);
+        merged[merged_count].tag[19] = '\0';
+
+        // confidence取平均
+        float sum_conf = results[i].confidence;
+        int conf_count = 1;
+        for (int j = i + 1; j < count; j++) {
+            if (used[j] && merge_num > 1) {
+                // 简化：只算被合并的
+            }
+        }
+        merged[merged_count].confidence = results[i].confidence; // 简化
+
+        used[i] = true;
+        merged_count++;
+    }
+
+    return merged_count;
+}
+
+// ============ 核心更新 ============
+int screen_update(ScreenState *state, CameraRequestLock *lock) {
+    if (!lock || !lock->isValid || !lock->isSUCCUSS || lock->count <= 0) {
+        // 没有有效数据，所有目标miss+1
+        for (int i = 0; i < MAX_TARGETS; i++) {
+            if (state->targets[i].active) {
+                state->targets[i].miss_count++;
+                if (state->targets[i].miss_count >= MISS_TIMEOUT) {
+                    state->targets[i].active = false;
+                    state->target_count--;
+                }
+            }
+        }
+        return state->target_count;
+    }
+
+    // 1. 合并帧内重叠框
+    CameraDetectResult merged[MAX_TARGETS];
+    int merged_count = merge_frame_detections(lock->Result, lock->count,
+                                               merged, MAX_TARGETS);
+
+    // 2. 标记所有现有目标为"本帧未匹配"
+    bool matched[MAX_TARGETS] = {false};
+
+    // 3. 匹配：每个合并后的检测框，找最近的现有目标
+    for (int m = 0; m < merged_count; m++) {
+        float mx = (float)merged[m].x;
+        float my = (float)merged[m].y;
+        float mw = (float)merged[m].w;
+        float mh = (float)merged[m].h;
+
+        // 找最佳匹配的现有目标
+        int best_idx = -1;
+        float best_iou = 0.0f;
+
+        for (int t = 0; t < MAX_TARGETS; t++) {
+            if (!state->targets[t].active || matched[t]) continue;
+
+            float iou = calc_iou(mx, my, mw, mh,
+                                 state->targets[t].x, state->targets[t].y,
+                                 state->targets[t].w, state->targets[t].h);
+
+            if (iou > best_iou && iou >= OVERLAP_THRESHOLD) {
+                best_iou = iou;
+                best_idx = t;
+            }
+        }
+
+        if (best_idx >= 0) {
+            // 匹配成功：更新现有目标
+            TrackedTarget *t = &state->targets[best_idx];
+
+            // 平滑位置（EMA滤波，减少抖动）
+            float alpha = 0.7f;  // 新观测权重
+            t->x = alpha * mx + (1.0f - alpha) * t->x;
+            t->y = alpha * my + (1.0f - alpha) * t->y;
+            t->w = alpha * mw + (1.0f - alpha) * t->w;
+            t->h = alpha * mh + (1.0f - alpha) * t->h;
+            t->center_x = t->x + t->w / 2.0f;
+            t->center_y = t->y + t->h / 2.0f;
+
+            // 更新贝叶斯滤波器
+            ObsType obs = tag_to_obs(merged[m].tag);
+            float dist = sqrtf(powf(t->center_x - 320.0f, 2) +
+                              powf(t->center_y - 240.0f, 2)); // 假设640x480
+            bayes_update(&t->type_filter, obs, merged[m].confidence, dist);
+
+            t->last_confidence = merged[m].confidence;
+            t->observe_count++;
+            t->miss_count = 0;
+            matched[best_idx] = true;
+
+        } else {
+            // 新目标：创建
+            for (int t = 0; t < MAX_TARGETS; t++) {
+                if (!state->targets[t].active) {
+                    TrackedTarget *nt = &state->targets[t];
+                    nt->id = state->next_id++;
+                    nt->active = true;
+                    nt->x = mx;
+                    nt->y = my;
+                    nt->w = mw;
+                    nt->h = mh;
+                    nt->center_x = mx + mw / 2.0f;
+                    nt->center_y = my + mh / 2.0f;
+                    nt->observe_count = 1;
+                    nt->miss_count = 0;
+                    nt->last_confidence = merged[m].confidence;
+
+                    bayes_init(&nt->type_filter);
+                    ObsType obs = tag_to_obs(merged[m].tag);
+                    float dist = sqrtf(powf(nt->center_x - 320.0f, 2) +
+                                      powf(nt->center_y - 240.0f, 2));
+                    bayes_update(&nt->type_filter, obs, merged[m].confidence, dist);
+
+                    state->target_count++;
+                    matched[t] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 4. 未匹配的现有目标：miss++
+    for (int t = 0; t < MAX_TARGETS; t++) {
+        if (state->targets[t].active && !matched[t]) {
+            state->targets[t].miss_count++;
+            if (state->targets[t].miss_count >= MISS_TIMEOUT) {
+                state->targets[t].active = false;
+                state->target_count--;
+            }
+        }
+    }
+
+    return state->target_count;
+}
+
+// ============ 查询 ============
+TrackedTarget* screen_get_center_target(ScreenState *state, int screen_w, int screen_h) {
+    TrackedTarget *best = NULL;
+    float best_dist = 1e10f;
+    float cx = screen_w / 2.0f;
+    float cy = screen_h / 2.0f;
+
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (!state->targets[i].active) continue;
+        float dx = state->targets[i].center_x - cx;
+        float dy = state->targets[i].center_y - cy;
+        float dist = sqrtf(dx * dx + dy * dy);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = &state->targets[i];
+        }
+    }
+    return best;
+}
+
+TrackedTarget* screen_get_by_id(ScreenState *state, int id) {
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (state->targets[i].active && state->targets[i].id == id) {
+            return &state->targets[i];
+        }
+    }
+    return NULL;
+}
+
+TrackedTarget* screen_get_best_target(ScreenState *state) {
+    TrackedTarget *best = NULL;
+    float best_prob = 0.0f;
+
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (!state->targets[i].active) continue;
+        RealType type = bayes_get_best(&state->targets[i].type_filter);
+        float prob = bayes_get_prob(&state->targets[i].type_filter, type);
+        if (prob > best_prob) {
+            best_prob = prob;
+            best = &state->targets[i];
+        }
+    }
+    return best;
+}
+```
+
+---
+
+## 在你的主循环里怎么用
+
+```c
+// 全局
+ScreenState screen;
+screen_init(&screen);
+
+// 每次收到摄像头数据
+void on_camera_result(CameraRequestLock *lock) {
+    // 更新屏幕状态（自动合并重叠框、匹配目标、更新概率）
+    int active_count = screen_update(&screen, lock);
+
+    // 获取你要操作的目标（比如离中心最近的）
+    TrackedTarget *target = screen_get_center_target(&screen, 640, 480);
+
+    if (target) {
+        RealType best_type = bayes_get_best(&target->type_filter);
+        float prob = bayes_get_prob(&target->type_filter, best_type);
+
+        if (prob > 0.7f) {
+            // 置信度够了，执行抓取
+            switch (best_type) {
+                case REAL_YUAN:  claw_type = YUAN;  break;
+                case REAL_SI:    claw_type = SI;    break;
+                // ... 其他映射
+            }
+            // 用 target->center_x, target->center_y 算误差
+        }
+    }
+}
+```
+
+---
+
+## 关键设计说明
+
+1. **帧内合并**：同一帧的YOLO检测结果先合并重叠框（IoU ≥ 0.5），避免一个物体被识别两次
+2. **帧间匹配**：用IoU匹配前后帧的同一个物体
+3. **EMA平滑**：位置用指数移动平均，减少YOLO框的抖动
+4. **每个目标独立滤波**：每个`TrackedTarget`有自己的`BayesFilter`，互不干扰
+5. **自动清理**：连续3帧没匹配到的目标自动移除
+6. **距离传给滤波器**：用目标到屏幕中心的距离动态调整似然矩阵

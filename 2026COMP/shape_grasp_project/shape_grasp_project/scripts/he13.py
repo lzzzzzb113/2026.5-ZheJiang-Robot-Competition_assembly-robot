@@ -1,0 +1,588 @@
+"""
+【组合模块 V11 (主被动结合版 + 完整角度还原版)】
+核心更新：
+1. 增加“视野广播”功能：在空闲无指令时，视觉系统会以 10Hz 频率主动向单片机发送当前画面所有可用物块坐标。
+2. 广播数据格式：V:标签1:x1:y1,标签2:x2:y2... (例: V:ms:320:240,pt:100:150)。画面为空时发送 V:null。
+3. 单片机收到广播后，自行计算最近目标，再下发 1-6 指令。
+4. 视觉收到 1-6 指令后，立刻切换回精准响应模式，计算并发送 [x,y,w,h,tag:conf:angle] 供单片机抓取。
+5. 完美还原了 he9.py 中的所有角度几何计算、辅助线绘制以及 UI 上的角度显示。
+"""
+import cv2
+import torch
+import numpy as np
+import math
+import itertools
+from ultralytics import YOLO
+import sys
+import os
+import time
+import serial
+import serial.tools.list_ports
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+# ==================== 配置区 ====================
+SHAPE_MODEL_PATH = "shape_grasp_project/runs/5184.pt"          # 形状模型路径
+MATERIAL_MODEL_PATH = "shape_grasp_project/runs/5183m.pt"    
+CAMERA_ID = 1                              
+CONF_THRESHOLD = 0.25                      
+USE_GPU = True                             
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+CMD_MAP = {
+    ord('1'): 'ps',   
+    ord('2'): 'ms',   
+    ord('3'): 'pt',   
+    ord('4'): 'mt',   
+    ord('5'): 'si',   
+    ord('6'): 'yuan', 
+}
+
+SHAPE_COLOR = {
+    'yuan': (0, 255, 255), 'si': (0, 165, 255), 
+    'ms': (100, 255, 100), 'ps': (0, 200, 0),     
+    'mt': (100, 100, 255), 'pt': (0, 0, 200),     
+    'san': (0, 255, 0),    'ti': (255, 0, 0)      
+}
+
+@dataclass
+class ShapeResult:
+    shape_type: str          
+    color_name: str          
+    center: Tuple[float, float]  
+    bbox: Tuple[int, int, int, int]  
+    contour_area: float      
+    dist_to_center: float    
+
+HSV_CONFIG = {
+    "red":   {"low":  [0,   100, 100], "high": [10,  255, 255]},
+    "red2":  {"low":  [160, 100, 100], "high": [179, 255, 255]}, 
+    "blue":  {"low":  [90,  50,  50],  "high": [140, 255, 255]}
+}
+ALLOWED_COLORS = ["red", "blue"]
+COLOR_BGR_MAP = {"red": (0, 0, 255), "blue": (255, 0, 0)}
+
+# ==================== 串口通信配置区 ====================
+BAUD_RATE = 9600                        
+ASCII_STX = 0x02
+ASCII_ETX = 0x03
+ASCII_ACK = 0x06
+ASCII_SYN = 0x16
+
+class SerialManager:
+    def __init__(self, baudrate):
+        self.baudrate = baudrate
+        self.ser = None
+        self.last_reconnect_time = 0
+        self.reconnect_interval = 2.0  
+        self.pending_cmd = None  
+
+    def check_and_connect(self):
+        if self.ser is not None and self.ser.is_open: return True
+        if time.time() - self.last_reconnect_time < self.reconnect_interval: return False
+        self.last_reconnect_time = time.time()
+        ports = list(serial.tools.list_ports.comports())
+        for p in ports:
+            try:
+                self.ser = serial.Serial(p.device, self.baudrate, timeout=0.02)
+                print(f"[INFO] >>> 成功连接到串口: {p.device} <<<")
+                return True
+            except serial.SerialException: continue
+        return False
+
+    def get_latest_command(self):
+        if not self.check_and_connect(): return None
+        if self.pending_cmd:
+            cmd = self.pending_cmd
+            self.pending_cmd = None
+            return cmd
+        if self.ser.in_waiting > 0:
+            try:
+                data = self.ser.read(self.ser.in_waiting)
+                for byte in reversed(data):
+                    b_char = bytes([byte])
+                    if b_char in [b'1', b'2', b'3', b'4', b'5', b'6', b'7']:
+                        return b_char
+            except Exception: pass
+        return None
+
+    def send_sync(self, data_str, timeout=0.1):
+        """精准抓取用的同步发送（等待ACK）"""
+        if not self.check_and_connect(): return False
+        try:
+            if self.ser.in_waiting > 0:
+                data = self.ser.read(self.ser.in_waiting)
+                for byte in reversed(data):
+                    b_char = bytes([byte])
+                    if b_char in [b'1', b'2', b'3', b'4', b'5', b'6', b'7']:
+                        self.pending_cmd = b_char
+                        break
+
+            packet = bytearray()
+            packet.append(ASCII_STX)
+            packet.extend(data_str.encode('utf-8'))
+            packet.append(ASCII_ETX)
+            self.ser.write(packet)
+
+            start_t = time.time()
+            while time.time() - start_t < timeout:
+                if self.ser.in_waiting > 0:
+                    reply = self.ser.read(1)
+                    if reply == bytes([ASCII_ACK]): return True
+                    elif reply in [b'1', b'2', b'3', b'4', b'5', b'6', b'7']:  
+                        self.pending_cmd = reply
+            return False
+        except serial.SerialException:
+            if self.ser: self.ser.close()
+            self.ser = None
+            return False
+
+    def send_broadcast(self, data_str):
+        """心跳广播专用：不阻塞，不等ACK"""
+        if not self.check_and_connect(): return
+        try:
+            packet = bytearray()
+            packet.append(ASCII_STX)
+            packet.extend(data_str.encode('utf-8'))
+            packet.append(ASCII_ETX)
+            self.ser.write(packet)
+        except serial.SerialException:
+            if self.ser: self.ser.close()
+            self.ser = None
+
+    def close(self):
+        if self.ser is not None and self.ser.is_open:
+            self.ser.close()
+
+# ==================== 几何处理核心函数 (完全还原 he9.py) ====================
+def apply_hsv_range(hsv, low, high): return cv2.inRange(hsv, np.array(low, dtype=np.uint8), np.array(high, dtype=np.uint8))
+
+def apply_color_mask(hsv, color_name, config): 
+    cfg = config.get(color_name) 
+    if not cfg: return np.zeros(hsv.shape[:2], dtype=np.uint8)
+    mask = apply_hsv_range(hsv, cfg["low"], cfg["high"])
+    if color_name + "2" in config: 
+        mask = cv2.bitwise_or(mask, apply_hsv_range(hsv, config[color_name + "2"]["low"], config[color_name + "2"]["high"]))
+    return mask
+
+def compute_center(contour): 
+    (cx, cy), r = cv2.minEnclosingCircle(contour)
+    return float(cx), float(cy)
+
+def find_best_single_slot(image, min_area=500):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    img_h, img_w = image.shape[:2]
+    img_cx, img_cy = img_w / 2.0, img_h / 2.0 
+    best_slot = None
+    min_distance = float('inf')
+    for color_name, cfg in HSV_CONFIG.items():
+        if color_name.endswith("2") or color_name not in ALLOWED_COLORS: continue
+        mask = apply_color_mask(hsv, color_name, HSV_CONFIG)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            hull = cv2.convexHull(cnt)
+            area = cv2.contourArea(hull)
+            if area < min_area: continue
+            x, y, bw, bh = cv2.boundingRect(hull)
+            if x <= 5 or y <= 5 or (x + bw) >= img_w - 5 or (y + bh) >= img_h - 5: continue
+            center = compute_center(hull)
+            dist_to_cam_center = math.hypot(center[0] - img_cx, center[1] - img_cy)
+            if dist_to_cam_center < min_distance:
+                min_distance, best_slot = dist_to_cam_center, ShapeResult("slot", color_name, center, (x, y, bw, bh), area, dist_to_cam_center)
+    return best_slot
+def detect_material_cv(roi_bgr, roi_thresh):
+    """
+    全新过滤算法：基于二值化掩码剔除背景干扰，精准提取表面材质特征
+    """
+    # 确保掩码有效
+    if roi_bgr.shape[:2] != roi_thresh.shape or roi_thresh.size == 0:
+        return 'plastic'
+        
+    # 计算有效目标面积
+    area = cv2.countNonZero(roi_thresh)
+    if area < 50: return 'plastic'
+
+    # 转为 HSV 并提取亮度(V)通道
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2]
+    
+    # 核心：只提取掩码内的像素（只看物块本身，无视绿色背景）
+    valid_v = v[roi_thresh > 127]
+    if len(valid_v) == 0: return 'plastic'
+
+    # 特征 1：掩码内亮度标准差 (金属表面受光不均，反差大；塑料光线漫反射，较均匀)
+    v_std = np.std(valid_v)
+
+    # 特征 2：高光极值点比例 (金属容易出现极亮耀斑，V值接近255)
+    high_light_count = np.sum(valid_v > 235)
+    highlight_ratio = high_light_count / area
+
+    # 特征 3：内部锐利纹理 (金属倒角或强反光容易在内部形成锐利边缘)
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    masked_gray = cv2.bitwise_and(gray, gray, mask=roi_thresh)
+    edges = cv2.Canny(masked_gray, 80, 200)
+    # 腐蚀一下掩码，防止物块的外部轮廓被算作内部边缘
+    eroded_mask = cv2.erode(roi_thresh, np.ones((5, 5), np.uint8))
+    internal_edges = cv2.bitwise_and(edges, edges, mask=eroded_mask)
+    edge_ratio = cv2.countNonZero(internal_edges) / area
+
+    # ================= 调试用 =================
+    # 取消下面这行的注释，可以在控制台看到当前物块的数据，方便你微调阈值
+    #print(f"Std: {v_std:.1f}, HighLight: {highlight_ratio:.3f}, Edges: {edge_ratio:.3f}")
+    # ==========================================
+
+    # 综合打分裁决 (以下阈值针对你的白色物块设计，可根据实际灯光微调)
+    metal_score = 0
+    if highlight_ratio < 0.4: metal_score = 1  # 存在高光耀斑
+
+    # 命中两项及以上判定为金属，否则为塑料
+    return 'metal' if metal_score >= 1 else 'plastic'
+def is_same_object(boxA, boxB, overlap_thresh=0.4):
+    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0: return False
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return (interArea / float(min(boxAArea, boxBArea))) > overlap_thresh
+
+def filter_smallest_boxes(boxes, classes, confs):
+    if len(boxes) == 0: return [], [], []
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+    sorted_indices = np.argsort(areas)
+    keep_boxes, keep_classes, keep_confs = [], [], []
+    for idx in sorted_indices:
+        boxA = boxes[idx]
+        if not any(is_same_object(boxA, kb) for kb in keep_boxes):
+            keep_boxes.append(boxA)
+            keep_classes.append(classes[idx])
+            keep_confs.append(confs[idx])
+    return keep_boxes, keep_classes, keep_confs
+
+def get_robust_angle_and_box(cnt, shape_type):
+    rect = cv2.minAreaRect(cnt)
+    (cx, cy), (w, h), theta = rect
+    box = cv2.boxPoints(rect).astype(np.int32)
+
+    if shape_type == 'san':  
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        shifted_cnt = cnt - np.array([[[x, y]]])
+        mask_shape = (bh + 10, bw + 10)
+        orig_mask = np.zeros(mask_shape, dtype=np.uint8)
+        cv2.drawContours(orig_mask, [shifted_cnt], -1, 255, -1)
+        hull = cv2.convexHull(shifted_cnt)
+        approx = cv2.approxPolyDP(hull, 0.015 * cv2.arcLength(hull, True), True)
+        pts = approx.reshape(-1, 2)
+        best_triangle, best_iou = None, 0.0
+
+        if len(pts) >= 3:
+            if len(pts) > 8: pts = pts[:8]
+            for combo in itertools.combinations(pts, 3):
+                tri_pts = np.array(combo, dtype=np.int32)
+                tri_mask = np.zeros(mask_shape, dtype=np.uint8)
+                cv2.drawContours(tri_mask, [tri_pts], -1, 255, -1)
+                intersection = cv2.bitwise_and(orig_mask, tri_mask)
+                area_inter = cv2.countNonZero(intersection)
+                area_union = (cv2.countNonZero(orig_mask) + cv2.countNonZero(tri_mask) - area_inter)
+                if area_union > 0:
+                    iou = area_inter / float(area_union)
+                    if iou > best_iou: best_iou, best_triangle = iou, tri_pts
+
+        if best_triangle is not None:
+            triangle = best_triangle + np.array([x, y])
+            triangle = np.expand_dims(triangle, axis=1)
+        else:
+            _, triangle = cv2.minEnclosingTriangle(cnt)
+
+        if triangle is not None and len(triangle) == 3:
+            pts = triangle.reshape(3, 2)
+            left_idx = np.argmin(pts[:, 0])
+            p_left = pts[left_idx]
+            p1, p2 = pts[(left_idx + 1) % 3], pts[(left_idx + 2) % 3]
+
+            dx1, dy1 = p1[0] - p_left[0], p1[1] - p_left[1]
+            angle1 = math.degrees(math.atan2(abs(dx1), abs(dy1))) if (dx1 or dy1) else 90
+            dx2, dy2 = p2[0] - p_left[0], p2[1] - p_left[1]
+            angle2 = math.degrees(math.atan2(abs(dx2), abs(dy2))) if (dx2 or dy2) else 90
+
+            if angle1 < angle2: 
+                best_angle, best_edge_pts, opp_pt, best_dy = angle1, (tuple(map(int, p_left)), tuple(map(int, p1))), tuple(map(int, p2)), dy1
+            else: 
+                best_angle, best_edge_pts, opp_pt, best_dy = angle2, (tuple(map(int, p_left)), tuple(map(int, p2))), tuple(map(int, p1)), dy2
+            if best_dy < 0: best_angle += 180.0
+            return best_angle, box, best_edge_pts, opp_pt
+        else: 
+            return 0.0, box, None, None
+
+    elif shape_type == 'ti': 
+        hull = cv2.convexHull(cnt)
+        approx = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True)
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2)
+            edges = []
+            for i in range(4):
+                p1, p2 = pts[i], pts[(i + 1) % 4]
+                vx, vy = p2[0] - p1[0], p2[1] - p1[1]
+                edges.append({'p1': p1, 'p2': p2, 'vx': vx, 'vy': vy, 'len': math.hypot(vx, vy)})
+
+            def calc_parallel_score(eA, eB):
+                if eA['len'] == 0 or eB['len'] == 0: return 0
+                return abs((eA['vx']*eB['vx'] + eA['vy']*eB['vy']) / (eA['len'] * eB['len']))
+
+            score02, score13 = calc_parallel_score(edges[0], edges[2]), calc_parallel_score(edges[1], edges[3])
+            base1, base2 = (edges[0], edges[2]) if score02 > score13 else (edges[1], edges[3])
+            long_base, short_base = (base1, base2) if base1['len'] > base2['len'] else (base2, base1)
+
+            mid_long = (int((long_base['p1'][0] + long_base['p2'][0]) / 2), int((long_base['p1'][1] + long_base['p2'][1]) / 2))
+            mid_short = (int((short_base['p1'][0] + short_base['p2'][0]) / 2), int((short_base['p1'][1] + short_base['p2'][1]) / 2))
+            best_angle = (math.degrees(math.atan2(mid_short[1] - mid_long[1], mid_short[0] - mid_long[0])) + 360) % 360
+            return best_angle, box, (mid_long, mid_short), None
+
+        M = cv2.moments(cnt)
+        if M['m00'] == 0: return 0.0, box, None, None
+        mcx, mcy = M['m10'] / M['m00'], M['m01'] / M['m00']
+        vx, vy = cx - mcx, cy - mcy
+        if math.hypot(vx, vy) < 1.0: return 0.0, box, None, None
+
+        best_angle = (math.degrees(math.atan2(vy, vx)) + 360) % 360
+        arrow_len = min(w, h) * 0.8
+        pt1 = (int(mcx), int(mcy))
+        pt2 = (int(mcx + math.cos(math.radians(best_angle)) * arrow_len), int(mcy + math.sin(math.radians(best_angle)) * arrow_len))
+        return best_angle, box, (pt1, pt2), None
+
+    else: 
+        max_len, best_angle = 0, 0
+        for i in range(4):
+            p1, p2 = box[i], box[(i + 1) % 4]
+            length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            if length > max_len:
+                max_len, best_angle = length, math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+        if best_angle < 0: best_angle += 180
+        if best_angle >= 180: best_angle -= 180
+        return best_angle, box, None, None
+
+def process_roi_geometry(frame_thresh, x1, y1, x2, y2, shape_type):
+    h_frame, w_frame = frame_thresh.shape
+    margin = 2
+    rx1, ry1 = max(0, int(x1) - margin), max(0, int(y1) - margin)
+    rx2, ry2 = min(w_frame, int(x2) + margin), min(h_frame, int(y2) + margin)
+    if rx2 - rx1 < 5 or ry2 - ry1 < 5: return 0.0, None, None, None
+    roi_thresh = frame_thresh[ry1:ry2, rx1:rx2].copy()
+    h_roi, w_roi = roi_thresh.shape
+    kernel_size = max(3, int(min(w_roi, h_roi) * 0.08))
+    eroded = cv2.erode(roi_thresh, np.ones((kernel_size, kernel_size), np.uint8), iterations=1)
+    contours_eroded, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_cnt = None
+    if contours_eroded:
+        cx_roi, cy_roi = w_roi / 2.0, h_roi / 2.0
+        min_dist = float('inf')
+        for c in contours_eroded:
+            M = cv2.moments(c)
+            if M['m00'] == 0: continue
+            dist = (M['m10'] / M['m00'] - cx_roi) ** 2 + (M['m01'] / M['m00'] - cy_roi) ** 2
+            if dist < min_dist: min_dist, best_cnt = dist, c
+    if best_cnt is not None:
+        clean_mask = np.zeros_like(roi_thresh)
+        cv2.drawContours(clean_mask, [best_cnt], -1, 255, -1)
+        roi_thresh = cv2.bitwise_and(roi_thresh, cv2.dilate(clean_mask, np.ones((kernel_size + 2, kernel_size + 2), np.uint8), iterations=1))
+    cv2.rectangle(roi_thresh, (0, 0), (w_roi - 1, h_roi - 1), 0, 1)
+    contours, _ = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return 0.0, None, None, None
+    cnt = max(contours, key=cv2.contourArea)
+    if shape_type in ['san', 'ti']:
+        approx = cv2.approxPolyDP(cnt, 0.035 * cv2.arcLength(cnt, True), True)
+        if len(approx) >= 3: cnt = approx
+
+    precise_angle, box_local, best_edge_local, opp_pt_local = get_robust_angle_and_box(cnt, shape_type)
+    box_global = box_local + np.array([rx1, ry1])
+    best_edge_global = (tuple(best_edge_local[0] + np.array([rx1, ry1])), tuple(best_edge_local[1] + np.array([rx1, ry1]))) if best_edge_local else None
+    opp_pt_global = tuple(opp_pt_local + np.array([rx1, ry1])) if opp_pt_local else None
+    return precise_angle, box_global, best_edge_global, opp_pt_global
+
+# ==================== 主程序 ====================
+def main():
+    if not os.path.exists(SHAPE_MODEL_PATH): return print(f"[ERROR] 形状模型不存在: {SHAPE_MODEL_PATH}")
+
+    serial_mgr = SerialManager(BAUD_RATE)
+    serial_mgr.check_and_connect()
+
+    device = 'cuda:0' if USE_GPU and torch.cuda.is_available() else 'cpu'
+    print(f"[INFO] 使用设备: {device}")
+    
+    shape_model = YOLO(SHAPE_MODEL_PATH)
+    shape_model.to(device)
+    material_model = YOLO(MATERIAL_MODEL_PATH).to(device) if os.path.exists(MATERIAL_MODEL_PATH) else None
+
+    cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW)
+    if not cap.isOpened(): cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+    print("[INFO] 视觉系统运行中...正在向单片机广播视野...按 'q' 退出")
+    
+    last_status = "Broadcasting View..."
+    last_color = (255, 255, 0)
+    last_broadcast_time = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: continue
+        h_frame, w_frame = frame.shape[:2]
+
+        cmd = serial_mgr.get_latest_command()
+
+        # ================= 转盘特例 =================
+        if cmd == b'7':
+            target = find_best_single_slot(frame, min_area=1000)
+            if target:
+                tcx, tcy = map(int, target.center)
+                bx, by, bw, bh = target.bbox
+                data_str = f"[[{tcx},{tcy},{bw},{bh},{target.color_name}:1.00:0.00]]"
+                success = serial_mgr.send_sync(data_str, timeout=0.1)
+                last_status, last_color = (f"Sent SLOT -> OK", (0, 255, 0)) if success else ("Send SLOT -> ERR", (0, 0, 255))
+            else:
+                serial_mgr.send_sync("[]", timeout=0.1)
+                last_status, last_color = ("No SLOT found -> []", (0, 0, 255))
+            cv2.putText(frame, last_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, last_color, 2)
+            cv2.imshow("Shape Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            continue
+
+        # ================= 常规推理 =================
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, frame_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results = shape_model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+        
+        boxes_xyxy_raw = results.obb.xyxy.cpu().numpy() if hasattr(results, 'obb') and results.obb is not None else (results.boxes.xyxy.cpu().numpy() if hasattr(results, 'boxes') and results.boxes is not None else [])
+        classes_raw = results.obb.cls.cpu().numpy() if hasattr(results, 'obb') and results.obb is not None else (results.boxes.cls.cpu().numpy() if hasattr(results, 'boxes') and results.boxes is not None else [])
+        confs_raw = results.obb.conf.cpu().numpy() if hasattr(results, 'obb') and results.obb is not None else (results.boxes.conf.cpu().numpy() if hasattr(results, 'boxes') and results.boxes is not None else [])
+
+        shape_names = shape_model.names
+        boxes_xyxy, classes, confs = filter_smallest_boxes(boxes_xyxy_raw, classes_raw, confs_raw)
+
+        requested_target_found = False
+        current_view_objects = []  
+
+        for i in range(len(boxes_xyxy)):
+            x1, y1, x2, y2 = map(int, boxes_xyxy[i])
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w_frame, x2), min(h_frame, y2)
+            
+            cls_id, conf = int(classes[i]), float(confs[i])
+            original_shape = shape_names[cls_id]
+            final_tag = original_shape  
+# --- 材质推理 (修正版) ---
+            if original_shape in ['san', 'ti'] and (x2 - x1) > 10 and (y2 - y1) > 10:
+                # 1. 提取当前物块的彩色 ROI
+                roi_bgr = frame[y1:y2, x1:x2].copy()
+                # 2. 提取当前物块对应的二值化 ROI (作为掩码剔除绿幕背景)
+                roi_thresh = frame_thresh[y1:y2, x1:x2].copy()
+                
+                # 默认使用纯 CV 特征过滤算法
+                final_material = detect_material_cv(roi_bgr, roi_thresh)
+                
+                # 如果你想保留 YOLO 材质模型作为辅助（可选）
+                if material_model is not None:
+                    mat_results = material_model(roi_bgr, conf=CONF_THRESHOLD, verbose=False)[0]
+                    # 只有当模型极其自信(>0.85)时，才覆盖 CV 的判断
+                    if hasattr(mat_results, 'boxes') and mat_results.boxes is not None and len(mat_results.boxes) > 0:
+                        mat_conf = float(mat_results.boxes.conf[0].item())
+                        if mat_conf > 0.85:
+                            cls_idx = int(mat_results.boxes.cls[0].item())
+                            material_name_raw = material_model.names[cls_idx].lower()
+                            final_material = 'metal' if 'metal' in material_name_raw else 'plastic'
+
+                # 映射到最终标签
+                if original_shape == 'san': 
+                    final_tag = 'ms' if final_material == 'metal' else 'ps'
+                elif original_shape == 'ti': 
+                    final_tag = 'mt' if final_material == 'metal' else 'pt'
+            # ===== 请确保把下面这两行补回来！=====
+            cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+            w, h = int(x2-x1), int(y2-y1)
+
+            # --- UI绘制与角度计算 (完整还原 he9.py) ---
+            color = SHAPE_COLOR.get(final_tag, (255, 255, 255))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # --- UI绘制与角度计算 (完整还原 he9.py) ---
+            color = SHAPE_COLOR.get(final_tag, (255, 255, 255))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            angle_deg = 0.0
+
+            if original_shape in ['san', 'ti']:
+                angle_deg, box_global, best_edge_global, opp_pt_global = \
+                    process_roi_geometry(frame_thresh, x1, y1, x2, y2, original_shape)
+                
+                angle_deg = angle_deg % 360.0 
+
+                if box_global is not None:
+                    cv2.polylines(frame, [box_global], True, (0, 255, 255), 2)
+                if best_edge_global is not None:
+                    cv2.arrowedLine(frame, best_edge_global[0], best_edge_global[1], (0, 0, 255), 3, tipLength=0.2)
+                    if original_shape == 'san':
+                        anchor_x = best_edge_global[0][0]
+                        cv2.line(frame, (anchor_x, y1 - 20), (anchor_x, y2 + 20), (0, 255, 255), 2)
+                if opp_pt_global is not None:
+                    cv2.circle(frame, opp_pt_global, 5, (0, 255, 0), -1)
+
+            elif original_shape == 'si':
+                angle_deg, box_global, _, _ = process_roi_geometry(frame_thresh, x1, y1, x2, y2, 'si')
+                angle_deg = angle_deg % 90.0
+                
+            # ================== 新增：角度归一化算法 ==================
+            angle_norm = angle_deg / 360.0
+            # ==========================================================
+
+            # 还原 he9 的 UI 文本 (带角度)，将这里改为显示 angle_norm，并保留4位小数以防精度丢失
+            label = f"{final_tag} {conf:.2f} Ang:{angle_norm:.4f}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # 收集广播信息 (标签:X:Y) 
+            broadcast_item = f"{final_tag}:{cx}:{cy}"
+            current_view_objects.append(broadcast_item)
+
+            # 【精准响应模式】：如果有 1-6 请求指令，立马打包发送带角度的精细数据
+            if cmd is not None and cmd in CMD_MAP and not requested_target_found:
+                target_tag = CMD_MAP[cmd]
+                if final_tag == target_tag:
+                    # 注意：这里的串口发送将角位替换为了归一化后的变量 angle_norm
+                    data_str = f"[{cx},{cy},{w},{h},{final_tag}:{conf:.4f}:{angle_norm:.4f}]"
+                    print(f"\n[INFO] 命中请求目标 {target_tag}，正发送: {data_str}")
+                    success = serial_mgr.send_sync(data_str, timeout=0.1)
+                    last_status = f"CMD:{cmd.decode()} -> {final_tag} OK" if success else f"CMD:{cmd.decode()} -> ERR"
+                    last_color = (0, 255, 0) if success else (0, 0, 255)
+                    requested_target_found = True
+
+        # 如果收到请求但没找到，兜底防止单片机死等
+        if cmd is not None and cmd in CMD_MAP and not requested_target_found:
+            serial_mgr.send_sync("[]", timeout=0.1)
+            last_status = f"CMD:{cmd.decode()} -> Not Found -> []"
+            last_color = (0, 0, 255)
+
+        # ================= 主动心跳广播 =================
+        if cmd is None:
+            current_time = time.time()
+            if current_time - last_broadcast_time > 0.1:  # 10Hz 频率
+                if current_view_objects:
+                    broadcast_str = "V:" + ",".join(current_view_objects)
+                else:
+                    broadcast_str = "V:null"
+                
+                serial_mgr.send_broadcast(broadcast_str)
+                last_broadcast_time = current_time
+                last_status = f"Broadcasting... ({len(current_view_objects)} items)"
+                last_color = (255, 255, 0) 
+
+        cv2.putText(frame, last_status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, last_color, 2)
+        cv2.imshow("Shape Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    cap.release()
+    serial_mgr.close()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
